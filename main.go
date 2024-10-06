@@ -1,30 +1,58 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"time"
 
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+
+	"strings"
+
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
-	"strings"
 )
 
 type Chat struct {
-	room     string
-	username string
-	time     time.Time
-	value    string
+	gorm.Model
+	Room     string
+	Username string
+	Time     time.Time
+	Message  string `gorm:"size:200"`
 }
 
 var chats []Chat
 
 func main() {
 
-	chats = append(chats, Chat{username: "alice", room: "global", time: time.Now(), value: "hallooo"})
-	chats = append(chats, Chat{username: "bob", room: "global", time: time.Now(), value: "haiii"})
+	db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
+	if err != nil {
+		log.Println("Failed to connect to database:", err)
+		return
+	}
+
+	err = db.AutoMigrate(&Chat{})
+	if err != nil {
+		log.Println("Failed to migrate schema:", err)
+		return
+	}
+
+	result := db.Find(&chats)
+
+	if result.Error != nil {
+		log.Println("Error retrieving users:", result.Error)
+		return
+	}
+
+	fmt.Println(len(chats))
+
+	if len(chats) < 1 {
+		chats = append(chats, Chat{Room: "global", Username: "Alice", Time: time.Now(), Message: "Hello World!!!"})
+	}
 
 	// SSH server configuration
 	config := &ssh.ServerConfig{
@@ -61,11 +89,11 @@ func main() {
 			continue
 		}
 
-		go handleConnection(nConn, config)
+		go handleConnection(nConn, config, db)
 	}
 }
 
-func handleConnection(nConn net.Conn, config *ssh.ServerConfig) {
+func handleConnection(nConn net.Conn, config *ssh.ServerConfig, db *gorm.DB) {
 	sshConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
 
 	if err != nil {
@@ -88,7 +116,7 @@ func handleConnection(nConn net.Conn, config *ssh.ServerConfig) {
 			continue
 		}
 
-		go handleSession(channel, requests, sshConn.User())
+		go handleSession(channel, requests, sshConn.User(), db)
 	}
 }
 
@@ -106,8 +134,8 @@ func prompt(term *terminal.Terminal, username string, room string, resp string) 
 	}
 
 	for _, chat := range chats {
-		if chat.room == room {
-			message := chat.time.Format("2006-01-02 15:04:05") + " | " + chat.username + ": " + chat.value + "\n"
+		if chat.Room == room {
+			message := chat.Time.Format("2006-01-02 15:04:05") + " | " + chat.Username + ": " + chat.Message + "\n"
 			term.Write([]byte(message))
 		}
 	}
@@ -122,8 +150,10 @@ func prompt(term *terminal.Terminal, username string, room string, resp string) 
 	// term.Write([]byte(prompt))
 
 }
-func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username string) {
+func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username string, db *gorm.DB) {
 	defer channel.Close()
+
+	sizeChat := len(chats)
 
 	term := terminal.NewTerminal(channel, "")
 	room := "global"
@@ -132,9 +162,12 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username s
 	prompt(term, username, room, "")
 	go func() {
 		for {
-			time.Sleep(200 * time.Millisecond)
+			if sizeChat != len(chats) {
+				time.Sleep(100 * time.Millisecond)
 
-			prompt(term, username, room, resp)
+				prompt(term, username, room, resp)
+				sizeChat = len(chats)
+			}
 		}
 	}()
 
@@ -160,8 +193,7 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username s
 				resp = "help"
 				prompt(term, username, room, resp)
 			case "/room":
-				log.Println("len :" + string(len(parts)))
-				if len(parts) > 0 {
+				if len(parts) > 1 {
 					room = parts[1]
 				} else {
 					room = "global"
@@ -171,7 +203,17 @@ func handleSession(channel ssh.Channel, requests <-chan *ssh.Request, username s
 		} else if input != "" {
 			resp = ""
 			prompt(term, username, room, resp)
-			chats = append(chats, Chat{username: username, room: room, time: time.Now(), value: input})
+
+			newChat := Chat{Username: username, Room: room, Time: time.Now(), Message: input}
+			log.Println(newChat)
+			result := db.Create(&newChat)
+			chats = append(chats, newChat)
+
+			if result.Error != nil {
+				log.Println("Failed to insert new chat:", result.Error)
+				return
+			}
+
 		} else {
 			prompt(term, username, room, resp)
 		}
